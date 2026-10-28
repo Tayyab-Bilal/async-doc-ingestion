@@ -13,6 +13,104 @@ query with its fast path, and the later reliability work (sweep, retention, type
 LLMs, OCR, speech-to-text, embeddings, the vector database and the web fetch are deterministic
 fakes.
 
+## At a glance
+
+**What it is.** A small reference implementation of a document ingestion service: one async API accepts any file, extracts its text, tags it, links it to related files and makes it searchable per tenant. It is built so a crash, a redelivered message or a re-upload never pays twice for OCR or embeddings.
+
+**What is built**
+- Submit, status and delete behind a FastAPI app (`api.py`, `service.py: IngestService.submit`).
+- A seven-stage resumable pipeline plus a separate index step (`pipeline.py: Pipeline.process`, `Pipeline.index`).
+- A hash check that makes unchanged re-uploads a no-op (`hashing.py: payload_hash`).
+- A self-healing sweep with an atomic claim (`sweep.py: sweep`, `store.py: claim_unindexed`).
+- A link cascade, chat attachment processor, retention cleanup, and an attachment query with a fast path (`linking.py`, `chat.py`, `retention.py`, `query.py: AttachmentQuery.ask`).
+- A per-call context envelope and a metering wrapper with a type contract (`context.py`, `metering.py`).
+
+**What is not built or simplified**
+- OCR, speech to text, embeddings, the vector database, the LLM specialists and web fetch are deterministic fakes.
+- Submit downloads the file to hash it; a real system would compare a version tag instead.
+- The query has no agent loop, spreadsheets are read as plain text, and `normalize` is a toy stemmer.
+- Storage is SQLite, and the Celery wiring is shown but never run by the tests.
+
+**How it flows**
+1. Submit downloads the file, hashes it and returns "unchanged" if nothing changed.
+2. Otherwise it creates or resets the job, returns 202 at once and queues the work.
+3. A worker runs each unfinished stage: download, extract, tag, normalize, classify, metadata, link.
+4. Extraction saves the OCR job id before polling, so a crash resumes the same OCR job.
+5. An empty document stops early and is never indexed.
+6. A separate index step embeds the text into the tenant's own collection.
+7. The sweep re-runs index for jobs that finished but were never indexed.
+8. Queries pick the attachment, take the fast path for empty files and spreadsheets, and otherwise search by dense plus keyword score.
+
+**Run it:** `.venv/bin/pytest -q` gives 79 passed, with no network.
+
+## How each part works, one by one
+
+### 1. Re-upload is a hash no-op
+- **Risk / problem:** The same file uploaded again, or the same message redelivered, would pay for OCR and embeddings a second time.
+- **How it works:**
+  - On submit the service downloads the bytes and builds one fingerprint from the metadata, the sorted labels and the hash of the content (`hashing.py: payload_hash`).
+  - Labels are sorted first, so a client sending the same labels in a different order does not count as a change.
+  - If the fingerprint and the source URL both match the stored job, it returns "unchanged" and queues nothing, so no stage runs (`service.py: IngestService.submit`).
+  - If the URL moved or the bytes changed, derived data and the tenant's vectors for that file are wiped, because an old OCR job id would belong to old bytes. Job history is kept.
+  - Simplification: it downloads the file just to hash it. A real system would compare a version tag and skip the download.
+- **Tests that prove it:** `tests/test_ingest.py`: `test_unchanged_resubmit_is_noop`, `test_label_order_is_not_a_change`, `test_new_storage_url_wipes_derived_keeps_history`, and 1 more in that file on changed labels (`test_changed_labels_reingests`).
+
+### 2. Crash-safe resume without blind retries
+- **Risk / problem:** A worker dies halfway. A blind retry would start a second paid OCR job and redo finished work.
+- **How it works:**
+  - Every stage saves its progress to the database after it finishes, so a redelivered message skips the done stages and carries on (`pipeline.py: Pipeline.process`).
+  - The OCR job id is saved before the service starts waiting on the result. A restarted worker finds the id and re-attaches to the same job instead of starting a new one (`pipeline.py: Pipeline._ocr`).
+  - Stages never catch general errors. A crash leaves the job marked running, which is exactly what lets the redelivered message resume it.
+  - The queue is set to acknowledge a message only after the task finishes, to put it back if the worker is killed, and to do zero automatic retries (`celery_app.py`).
+  - Simplification: a crash in the tiny gap between starting OCR and saving its id can still pay once more. Production would pass the job id as the provider's idempotency key.
+- **Tests that prove it:** `tests/test_ingest.py`: `test_crash_after_ocr_start_resumes_same_ocr_job`, `test_resume_skips_finished_stages`, and 1 more in `tests/test_contracts.py` (`test_celery_crash_safety_settings_and_beat_schedule_are_declared`).
+
+### 3. Self-healing sweep with an atomic claim
+- **Risk / problem:** A job can finish all its stages but never get indexed, for example if the worker dies at the last step or the vector store is down. Two sweepers might also both re-index it and pay twice.
+- **How it works:**
+  - Indexing is its own step, so the sweep can redo only that and never redo OCR (`pipeline.py: Pipeline.index`).
+  - The sweep looks for completed jobs that are not indexed and are at least fifteen minutes old, so jobs still in flight are left alone (`sweep.py: sweep`).
+  - Claiming is one database update that both picks the rows and marks them with a token. The database runs writers one at a time, so two sweepers can never claim the same job (`store.py: claim_unindexed`).
+  - The attempt counter goes up at claim time, so a sweeper that dies still counts. After five attempts the job is left for a human, and each run takes at most fifty jobs.
+  - Empty documents are skipped, and claims are released afterward so a failed job can be tried again until the cap.
+- **Tests that prove it:** `tests/test_sweep.py`: `test_two_concurrent_sweeps_never_double_index`, `test_sweep_respects_min_age_attempt_cap_batch`, `test_sweep_ignores_empty_documents`, and 1 more in that file.
+
+### 4. Empty file is a hard stop
+- **Risk / problem:** If an empty attachment fell through to a search, the assistant could answer from a different document and sound confident.
+- **How it works:**
+  - During extraction, a document with no readable text ends the job as completed with a "no readable content" note, before tagging or indexing (`pipeline.py: Pipeline._extract`).
+  - It is never embedded, and the sweep skips it, so nobody pays for it.
+  - At question time, an empty file is answered with "no readable content" before any retrieval runs, so no other file can be used instead (`query.py: AttachmentQuery.ask`).
+  - Chat attachments follow the same rule: an empty one is recorded as empty and not indexed (`chat.py: ChatAttachmentProcessor.process`).
+- **Tests that prove it:** `tests/test_query.py`: `test_empty_workspace_file_is_a_hard_stop_not_another_document`, `test_empty_chat_file_is_a_hard_stop_not_another_document`; `tests/test_chat.py`: `test_empty_attachment_is_a_hard_stop_and_is_not_indexed`, `test_empty_content_stops_before_any_specialist_runs`; `tests/test_ingest.py`: `test_empty_document_never_indexes`.
+
+### 5. Per-call context envelope
+- **Risk / problem:** If parallel questions share one "current attachment" slot, the last writer wins and one question reads another question's file.
+- **How it works:**
+  - Each call carries its own small envelope holding its attachment and tenant, stored in a context variable that each async task gets its own copy of (`context.py: CallEnvelope`).
+  - Tasks therefore cannot see each other's values, even when they interleave while waiting.
+  - The attachment is chosen by a fixed order: the explicit argument first, then the envelope, then the shared default (`context.py: resolve`).
+  - The query uses the same order, so a tool that is never handed an id still reads the right file (`query.py: AttachmentQuery.ask`).
+- **Tests that prove it:** `tests/test_context.py`: `test_parallel_queries_do_not_cross_contaminate`, `test_envelope_beats_shared_default_but_explicit_beats_envelope`, `test_resolve_precedence`; `tests/test_query.py`: `test_parallel_queries_each_read_their_own_attachment_via_the_envelope`.
+
+### 6. Tenant isolation by construction
+- **Risk / problem:** One tenant must never see another tenant's files or vectors.
+- **How it works:**
+  - Each tenant gets its own vector collection, so a search simply cannot reach another tenant's data. It is not a filter that could be forgotten (`providers.py: collection_for`).
+  - Delete removes rows and vectors from the right collection and reports accurate counts (`service.py: IngestService.delete`).
+  - A scoped question for an attachment that belongs to another tenant is answered as "not found" (`query.py: AttachmentQuery.ask`).
+  - Link candidates are drawn only from the same tenant, and chat extractions are looked up by tenant as well.
+  - Simplification: chat vectors share the tenant's collection and are told apart by a source tag.
+- **Tests that prove it:** `tests/test_linking_vectors.py`: `test_vectors_isolated_per_tenant`, `test_delete_removes_rows_and_vectors_with_counts`, and 1 more in that file; `tests/test_query.py`: `test_tenant_boundary_hides_other_tenants_attachments`; `tests/test_chat.py`: `test_chat_extraction_is_tenant_scoped`.
+
+### 7. Wrappers must subclass the library base class
+- **Risk / problem:** A metering wrapper that only passed calls through to the embedder failed the vector library's type check, and every document failed to ingest.
+- **How it works:**
+  - The metered embedder counts billable texts and inherits from the same base class the library checks for (`metering.py: MeteredEmbedder`).
+  - A stand-in for the third-party store refuses anything that is not that type, so the original outage is reproduced in the test suite (`metering.py: StrictVectorStore`).
+  - The lesson is that duck typing is not enough when a library checks the type of what it is given.
+- **Tests that prove it:** `tests/test_contracts.py`: `test_delegating_wrapper_without_the_base_class_is_rejected_by_the_library`, `test_metered_wrapper_subclasses_the_third_party_base_class`, and 2 more in that file.
+
 ## The problem
 
 Users attach files everywhere in "Acme Workspace": tasks, projects, meetings, the communication
@@ -175,6 +273,8 @@ specialists in parallel; anything else is retrieved by `0.5 * dense + 0.5 * keyw
 passed to the document specialist.
 
 ## Design decisions
+
+The key mechanisms are explained one by one in [How each part works](#how-each-part-works-one-by-one); this list gives the reasons and rejected options.
 
 1. **Submit returns 202 at once.** Clients poll per-stage progress. Rejected: waiting for OCR in the
    request, which blocks uploads and times out.
